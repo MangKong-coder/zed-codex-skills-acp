@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Sync MCP server configs from Codex/Claude-style files into Zed settings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+DEFAULT_CODEX_CONFIG = HOME / ".codex/config.toml"
+DEFAULT_ZED_SETTINGS = HOME / ".config/zed/settings.json"
+
+
+def strip_json_comments(text: str) -> str:
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        next_char = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            output.append(char)
+            i += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+
+        output.append(char)
+        i += 1
+
+    return "".join(output)
+
+
+def strip_trailing_commas(text: str) -> str:
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def parse_jsonc(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    text = strip_trailing_commas(strip_json_comments(path.read_text(encoding="utf-8")))
+    return json.loads(text)
+
+
+def parse_value(raw: str) -> Any:
+    raw = raw.strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        return bytes(raw[1:-1], "utf-8").decode("unicode_escape")
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [parse_value(part) for part in split_top_level(inner, ",")]
+    if raw.startswith("{") and raw.endswith("}"):
+        inner = raw[1:-1].strip()
+        result: dict[str, Any] = {}
+        if inner:
+            for part in split_top_level(inner, ","):
+                key, value = part.split("=", 1)
+                result[key.strip().strip('"')] = parse_value(value)
+        return result
+    if raw in {"true", "false"}:
+        return raw == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def split_top_level(text: str, delimiter: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        elif char == delimiter and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
+SECTION_RE = re.compile(r'^\[mcp_servers\.(?:"([^"]+)"|([^\]]+))\]\s*$')
+
+
+def parse_codex_mcp_servers(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+
+    servers: dict[str, dict[str, Any]] = {}
+    current: str | None = None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        section = SECTION_RE.match(stripped)
+        if section:
+            current = section.group(1) or section.group(2)
+            servers[current] = {}
+            continue
+
+        if stripped.startswith("["):
+            current = None
+            continue
+
+        if current and "=" in stripped:
+            key, value = stripped.split("=", 1)
+            servers[current][key.strip()] = parse_value(value)
+
+    return servers
+
+
+def parse_mcp_json(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    data = parse_jsonc(path)
+    servers = data.get("mcpServers") or data.get("mcp_servers") or {}
+    return servers if isinstance(servers, dict) else {}
+
+
+def to_zed_context_server(config: dict[str, Any]) -> dict[str, Any] | None:
+    if "url" in config:
+        server: dict[str, Any] = {"url": config["url"]}
+        if "headers" in config and isinstance(config["headers"], dict):
+            server["headers"] = config["headers"]
+        if "timeout" in config and isinstance(config["timeout"], int):
+            server["timeout"] = config["timeout"]
+        return server
+
+    command = config.get("command")
+    if not command:
+        return None
+
+    server = {"command": command}
+    if isinstance(config.get("args"), list):
+        server["args"] = config["args"]
+    if isinstance(config.get("env"), dict):
+        server["env"] = config["env"]
+    return server
+
+
+def collect_servers(codex_config: Path, mcp_json_files: list[Path]) -> dict[str, dict[str, Any]]:
+    servers = parse_codex_mcp_servers(codex_config)
+    for path in mcp_json_files:
+        for name, config in parse_mcp_json(path).items():
+            servers.setdefault(name, config)
+    return {
+        name: zed
+        for name, config in sorted(servers.items())
+        if isinstance(config, dict) and (zed := to_zed_context_server(config)) is not None
+    }
+
+
+def sync_zed_settings(
+    zed_settings: Path,
+    codex_config: Path,
+    mcp_json_files: list[Path],
+    prefix: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    settings = parse_jsonc(zed_settings)
+    context_servers = settings.setdefault("context_servers", {})
+    if not isinstance(context_servers, dict):
+        raise ValueError("Zed settings `context_servers` must be an object")
+
+    imported = collect_servers(codex_config, mcp_json_files)
+    for name, server in imported.items():
+        context_servers[f"{prefix}{name}"] = server
+
+    if not dry_run:
+        if zed_settings.exists():
+            backup = zed_settings.with_suffix(zed_settings.suffix + ".bak")
+            shutil.copy2(zed_settings, backup)
+        zed_settings.parent.mkdir(parents=True, exist_ok=True)
+        zed_settings.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+    return imported
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--zed-settings", type=Path, default=DEFAULT_ZED_SETTINGS)
+    parser.add_argument("--codex-config", type=Path, default=DEFAULT_CODEX_CONFIG)
+    parser.add_argument("--mcp-json", type=Path, action="append", default=[])
+    parser.add_argument("--prefix", default="")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    imported = sync_zed_settings(
+        args.zed_settings,
+        args.codex_config,
+        args.mcp_json,
+        args.prefix,
+        args.dry_run,
+    )
+    verb = "Would sync" if args.dry_run else "Synced"
+    print(f"{verb} {len(imported)} MCP server(s) into {args.zed_settings}:")
+    for name in imported:
+        print(f"- {args.prefix}{name}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

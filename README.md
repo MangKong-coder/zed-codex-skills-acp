@@ -104,3 +104,34 @@ Run the small test suite:
 ```sh
 python3 -m unittest discover -s tests
 ```
+
+## Sync Existing MCP Servers Into Zed
+
+Zed does not automatically read MCP servers from Codex or Claude config files. This repo includes a sync command that mirrors compatible local MCP server entries into Zed's `context_servers`.
+
+Preview the import:
+
+```sh
+scripts/sync-zed-mcp --dry-run
+```
+
+Apply it:
+
+```sh
+scripts/sync-zed-mcp
+```
+
+By default this reads `~/.codex/config.toml` and writes `~/.config/zed/settings.json`, creating a `.bak` backup beside the Zed settings file first.
+
+You can also import Claude-style `.mcp.json` files:
+
+```sh
+scripts/sync-zed-mcp --mcp-json /path/to/.mcp.json
+```
+
+Supported server shapes:
+
+- stdio servers with `command`, optional `args`, and optional `env`
+- HTTP servers with `url`, optional `headers`, and optional `timeout`
+
+Unsupported fields are ignored rather than guessed.
