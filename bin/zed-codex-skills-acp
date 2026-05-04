@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Expose local Codex/agent skills as slash commands in Zed's Codex ACP UI.
+
+This is a transparent ACP proxy:
+
+    Zed -> zed-codex-skills-acp -> codex-acp -> Codex
+
+It augments `available_commands_update` notifications with local skill names and
+rewrites `/skill-name ...` prompt turns into regular text that asks Codex to use
+the selected local skill.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import selectors
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+ZED_DB = HOME / "Library/Application Support/Zed/db/0-stable/db.sqlite"
+CODEX_CONFIG = HOME / ".codex/config.toml"
+LOG_PATH = Path(os.environ.get("ZED_CODEX_SKILLS_ACP_LOG", HOME / ".cache/zed-codex-skills-acp/proxy.log"))
+
+
+def log(message: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(message + "\n")
+    except OSError:
+        pass
+
+
+def send_json_line(file: Any, message: dict[str, Any]) -> None:
+    file.write(json.dumps(message, separators=(",", ":")) + "\n")
+    file.flush()
+
+
+def command_name(raw: str) -> str:
+    raw = raw.strip().replace("/", "-")
+    raw = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw)
+    raw = re.sub(r"-+", "-", raw).strip("-._:")
+    return raw or "skill"
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+
+    values: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def first_heading(text: str) -> str | None:
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return None
+
+
+def project_roots_from_codex_config() -> list[Path]:
+    if not CODEX_CONFIG.exists():
+        return []
+
+    roots: list[Path] = []
+    text = CODEX_CONFIG.read_text(encoding="utf-8", errors="replace")
+    for match in re.finditer(r'^\[projects\."([^"]+)"\]', text, re.MULTILINE):
+        roots.append(Path(match.group(1)).expanduser())
+    return roots
+
+
+def zed_workspace_roots() -> list[Path]:
+    if not ZED_DB.exists():
+        return []
+
+    roots: list[Path] = []
+    try:
+        conn = sqlite3.connect(str(ZED_DB))
+        try:
+            for (paths,) in conn.execute(
+                "select paths from workspaces where paths is not null order by timestamp desc limit 50"
+            ):
+                if paths:
+                    roots.extend(Path(part).expanduser() for part in str(paths).splitlines() if part)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    return roots
+
+
+def extra_roots() -> list[Path]:
+    raw = os.environ.get("CODEX_SKILLS_EXTRA_ROOTS", "")
+    return [Path(part).expanduser() for part in raw.split(":") if part]
+
+
+def candidate_roots() -> list[Path]:
+    roots: list[Path] = []
+    roots.extend(extra_roots())
+    roots.extend(zed_workspace_roots())
+    roots.extend(project_roots_from_codex_config())
+    roots.append(Path.cwd())
+    roots.extend([HOME / ".agents", HOME / ".codex", HOME / ".claude"])
+
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
+
+
+def skill_files() -> list[Path]:
+    files: list[Path] = []
+    for root in candidate_roots():
+        for rel in (
+            ".agents/skills/*/SKILL.md",
+            ".codex/skills/*/SKILL.md",
+            ".claude/skills/*/SKILL.md",
+            "skills/*/SKILL.md",
+        ):
+            files.extend(root.glob(rel))
+
+    files.extend((HOME / ".agents/skills").glob("*/SKILL.md"))
+    files.extend((HOME / ".codex/skills").glob("*/SKILL.md"))
+    files.extend((HOME / ".claude/skills").glob("*/SKILL.md"))
+    files.extend((HOME / ".codex/plugins/cache").glob("*/*/*/skills/*/SKILL.md"))
+    files.extend((HOME / ".codex/plugins/cache").glob("*/*/*/*/skills/*/SKILL.md"))
+
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in files:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
+
+
+def plugin_prefix(path: Path) -> str | None:
+    parts = path.parts
+    try:
+        cache_idx = parts.index("cache")
+    except ValueError:
+        return None
+
+    if cache_idx + 2 >= len(parts) or "plugins" not in parts[:cache_idx]:
+        return None
+    return command_name(parts[cache_idx + 2])
+
+
+def scope_prefix(path: Path) -> str:
+    for marker in (".agents", ".codex", ".claude", "skills"):
+        if marker in path.parts:
+            idx = path.parts.index(marker)
+            if idx > 0:
+                return command_name(path.parts[idx - 1])
+    return "skill"
+
+
+def build_skill_registry() -> dict[str, dict[str, str]]:
+    registry: dict[str, dict[str, str]] = {}
+    for path in skill_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        metadata = parse_frontmatter(text)
+        skill_name = command_name(metadata.get("name") or path.parent.name)
+        description = metadata.get("description") or first_heading(text) or f"Use {skill_name}"
+
+        prefix = plugin_prefix(path)
+        name = command_name(f"{prefix}:{skill_name}" if prefix else skill_name)
+        if name in registry and registry[name]["path"] != str(path):
+            name = command_name(f"{scope_prefix(path)}-{skill_name}")
+        if name in registry:
+            continue
+
+        registry[name] = {
+            "name": name,
+            "skill_name": skill_name,
+            "description": description[:280],
+            "path": str(path),
+        }
+
+    return dict(sorted(registry.items(), key=lambda item: item[0].lower()))
+
+
+def skill_commands() -> list[dict[str, Any]]:
+    commands = []
+    for entry in build_skill_registry().values():
+        commands.append(
+            {
+                "name": entry["name"],
+                "description": entry["description"],
+                "input": {"hint": "<task>"},
+            }
+        )
+    return commands
+
+
+def merge_available_commands(message: dict[str, Any]) -> dict[str, Any]:
+    update = ((message.get("params") or {}).get("update") or {})
+    if update.get("sessionUpdate") != "available_commands_update":
+        return message
+
+    existing = update.get("availableCommands") or []
+    seen = {command.get("name") for command in existing if isinstance(command, dict)}
+    merged = list(existing)
+    for command in skill_commands():
+        if command["name"] not in seen:
+            merged.append(command)
+            seen.add(command["name"])
+
+    update["availableCommands"] = merged
+    log(f"augmented available commands: {len(existing)} -> {len(merged)}")
+    return message
+
+
+SLASH_COMMAND_RE = re.compile(r"^/([A-Za-z0-9_.:-]+)(?:\s+(.*))?$", re.DOTALL)
+
+
+def rewrite_skill_prompt(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("method") != "session/prompt":
+        return message
+
+    params = message.get("params") or {}
+    blocks = params.get("prompt")
+    if not isinstance(blocks, list):
+        return message
+
+    registry = build_skill_registry()
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+
+        text = str(block.get("text") or "")
+        match = SLASH_COMMAND_RE.match(text.strip())
+        if not match:
+            continue
+
+        command = match.group(1)
+        task = match.group(2) or ""
+        entry = registry.get(command)
+        if entry is None:
+            continue
+
+        prompt = f"Use the local skill named `{entry['skill_name']}` from `{entry['path']}` for this task."
+        if task:
+            prompt += f"\n\nTask: {task.strip()}"
+        block["text"] = prompt
+        log(f"expanded slash command /{command}")
+        break
+
+    return message
+
+
+def session_id_from_response(message: dict[str, Any], pending: dict[Any, str]) -> str | None:
+    request_id = message.get("id")
+    method = pending.pop(request_id, None)
+    if method != "session/new":
+        return None
+
+    result = message.get("result") or {}
+    session_id = result.get("sessionId")
+    return str(session_id) if session_id else None
+
+
+def command_update(session_id: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": skill_commands(),
+            },
+        },
+    }
+
+
+def find_real_codex_acp() -> Path | None:
+    env_path = os.environ.get("REAL_CODEX_ACP")
+    if env_path:
+        path = Path(env_path).expanduser()
+        if path.exists():
+            return path
+
+    path_from_env = shutil.which("codex-acp")
+    if path_from_env:
+        return Path(path_from_env)
+
+    zed_registry = HOME / "Library/Application Support/Zed/external_agents/registry/codex-acp"
+    candidates = sorted(
+        zed_registry.glob("*/codex-acp"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+
+    return None
+
+
+def main() -> int:
+    real_codex_acp = find_real_codex_acp()
+    if real_codex_acp is None:
+        sys.stderr.write(
+            "zed-codex-skills-acp: could not find codex-acp. "
+            "Set REAL_CODEX_ACP=/path/to/codex-acp.\n"
+        )
+        return 127
+
+    process = subprocess.Popen(
+        [str(real_codex_acp), *sys.argv[1:]],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        text=True,
+        bufsize=1,
+        env=os.environ.copy(),
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+
+    selector = selectors.DefaultSelector()
+    selector.register(sys.stdin, selectors.EVENT_READ, "client")
+    selector.register(process.stdout, selectors.EVENT_READ, "agent")
+    pending: dict[Any, str] = {}
+
+    log(f"proxy started; real_codex_acp={real_codex_acp}")
+    while True:
+        if process.poll() is not None:
+            return process.returncode or 0
+
+        for key, _ in selector.select(timeout=0.1):
+            line = key.fileobj.readline()
+            if line == "":
+                if key.data == "client":
+                    process.stdin.close()
+                    selector.unregister(sys.stdin)
+                    continue
+                return process.returncode or 0
+
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                if key.data == "agent":
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                else:
+                    process.stdin.write(line)
+                    process.stdin.flush()
+                continue
+
+            if key.data == "client":
+                method = message.get("method")
+                if method in {"session/new", "session/load"} and "id" in message:
+                    pending[message["id"]] = method
+                message = rewrite_skill_prompt(message)
+                send_json_line(process.stdin, message)
+            else:
+                message = merge_available_commands(message)
+                send_json_line(sys.stdout, message)
+                session_id = session_id_from_response(message, pending)
+                if session_id:
+                    send_json_line(sys.stdout, command_update(session_id))
+                    log(f"injected available commands after new session {session_id}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
